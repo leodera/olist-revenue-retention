@@ -1,0 +1,6 @@
+# .gitignore
+.streamlit/secrets.toml
+venv/
+__pycache__/
+*.parquet
+.ipynb
