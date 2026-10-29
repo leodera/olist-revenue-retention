@@ -1,0 +1,4 @@
+-r requirements.txt
+requests>=2.31
+pyarrow>=14.0
+fsspec>=2023.1

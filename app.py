@@ -1,253 +1,536 @@
-import streamlit as st
+"""
+Olist Revenue Drivers & Customer Retention Audit  (built with Dash)
+
+WHAT THE APP READS
+    The small summary files in data_summary/, made by prepare_data.py.
+    No raw data and no secret token are needed to run it.
+
+HOW TO RUN ON YOUR COMPUTER
+    pip install -r requirements.txt
+    python app.py
+    Open http://127.0.0.1:8050
+
+HOW A HOSTING SERVICE (RENDER) RUNS IT
+    gunicorn app:server
+
+DASH VOCABULARY
+    component   A building block of the page (a title, a box, a chart, a dropdown...).
+    layout      The tree of components = what the page looks like.
+    figure      The chart itself (a Plotly object). dcc.Graph just displays it.
+    id          A name that lets a callback find a component.
+    callback    A function Dash runs when the user touches a control.
+                Input = the control that changed, Output = what gets updated.
+"""
+import json
+from pathlib import Path
+
 import pandas as pd
-import requests
-import plotly.express as px
+import plotly.graph_objects as go
+from dash import Dash, Input, Output, dash_table, dcc, html
+from dash.dash_table.Format import Format, Group, Scheme
 
-# ---------------------------------------------------------
-# Page Setup
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="Olist Commercial and Retention Audit",
-    layout="wide"
-)
+# =====================================================================
+# 0. SETTINGS
+# =====================================================================
+DATA_DIR = Path(__file__).parent / "data_summary"
+AUTHOR = "Pascal Ndife"
+GITHUB_URL = "https://github.com/leodera/olist-revenue-retention"
+QUESTION = "Which categories and states drive the most revenue, and do those customers ever come back to buy again?"
+REVENUE_NOTE = "Delivered orders only. Revenue = sum of item price, freight excluded."
 
-# ---------------------------------------------------------
-# Data Processing Pipeline (Parquet Loader + Business Model)
-# ---------------------------------------------------------
-@st.cache_data(ttl="6h")
-def load_parquet_data():
-    owner = "leodera"
-    repo = "file_explorer"
-    path = "olist"
-    
-    # Safely retrieve token from st.secrets
-    token = st.secrets["GITHUB_TOKEN"]
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json"
+NAVY, BLUE, LIGHT, ORANGE, GREY = "#1E3A8A", "#2563EB", "#BFD4FB", "#F97316", "#94A3B8"
+TEXT, MUTED, BG, BORDER = "#0F172A", "#64748B", "#F8FAFC", "#E2E8F0"
+FONT = "Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+
+
+# =====================================================================
+# 1. LOAD THE SUMMARY FILES
+# =====================================================================
+def read(name: str) -> pd.DataFrame:
+    path = DATA_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {path}. Run 'python prepare_data.py' first (see the README).")
+    return pd.read_csv(path)
+
+
+state_all = read("state_summary.csv").sort_values("total_revenue", ascending=False).reset_index(drop=True)
+freq_all = read("freq_by_state.csv")
+spenders_all = read("top_spenders.csv")
+categories = read("category_summary.csv").sort_values("gross_sales", ascending=False).reset_index(drop=True)
+recon = json.loads((DATA_DIR / "recon.json").read_text())
+ALL_STATE_CODES = list(state_all["customer_state"])
+
+
+def money(x: float) -> str:
+    if x >= 1e6:
+        return f"R$ {x / 1e6:.2f}M"
+    if x >= 1e3:
+        return f"R$ {x / 1e3:.1f}k"
+    return f"R$ {x:,.0f}"
+
+
+def pick(df: pd.DataFrame, selected) -> pd.DataFrame:
+    """Rows for the chosen states. Nothing chosen = all states."""
+    if not selected:
+        return df
+    return df[df["customer_state"].isin(selected)]
+
+
+# =====================================================================
+# 2. NUMBERS AND TEXT (every sentence on the page is computed from the data)
+# =====================================================================
+def kpi_values(selected) -> dict:
+    s = pick(state_all, selected)
+    buyers = int(s["total_buyers"].sum())
+    repeat = int(s["repeat_buyers"].sum())
+    orders = int(s["total_orders"].sum())
+    return {
+        "revenue": float(s["total_revenue"].sum()),
+        "buyers": buyers,
+        "repeat_rate": repeat / buyers * 100 if buyers else 0.0,
+        "avg_orders": orders / buyers if buyers else 0.0,
     }
-    
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    response = requests.get(api_url, headers=headers)
-    response.raise_for_status()
-    contents = response.json()
-    
-    storage = {"Authorization": f"Bearer {token}"}
-    dfs = {}
-    
-    for file in contents:
-        if file.get("type") == "file" and file["name"].endswith(".parquet"):
-            key_name = file["name"].replace(".parquet", "")
-            download_url = file["download_url"]
-            dfs[key_name] = pd.read_parquet(download_url, storage_options=storage)
-            
-    # Unpack individual tables
-    customers = dfs.get("customers")
-    orders = dfs.get("orders")
-    items = dfs.get("order_items")
-    payments = dfs.get("payments")
-    products = dfs.get("products")
-    categories = dfs.get("product_category")
-    
-    # 1. Fulfilled orders only
-    delivered_orders = orders[orders["order_status"] == "delivered"].copy()
-    
-    # 2. Product items pipeline (preserves order_item_id)
-    delivered_items = items.merge(delivered_orders[["order_id"]], on="order_id", how="inner")
-    df_items = (
-        delivered_items.merge(products, on="product_id", how="inner")
-        .merge(categories, on="product_category_name", how="inner")
+
+
+def state_table(selected) -> pd.DataFrame:
+    s = pick(state_all, selected).copy()
+    s["repeat_pct"] = s["repeat_buyers"] / s["total_buyers"] * 100
+    return s
+
+
+def geo_finding(selected) -> str:
+    s = state_table(selected)
+    if len(s) < 4:
+        return "Select at least 4 states (or none, for all states) to compare revenue with repeat rate."
+    top3 = s.head(3)
+    share = top3["total_revenue"].sum() / s["total_revenue"].sum() * 100
+    rho = s["total_revenue"].corr(s["repeat_pct"], method="spearman")
+    weak = abs(rho) < 0.3
+    return (
+        f"The top 3 states ({', '.join(top3['customer_state'])}) bring in {share:.1f}% of revenue in this view, "
+        f"with repeat rates between {top3['repeat_pct'].min():.1f}% and {top3['repeat_pct'].max():.1f}%. "
+        f"Across the {len(s)} states, the rank correlation between revenue and repeat rate is {rho:.2f} "
+        + ("(weak), so a bigger market does not mean more loyal customers." if weak
+           else "(not weak), so bigger markets tend to differ in loyalty.")
     )
-    
-    # 3. Pre-aggregate payments by order_id to prevent join fan-out
-    order_payments = payments.groupby("order_id")["payment_value"].sum().reset_index()
-    
-    # 4. Join at order grain
-    df_orders = (
-        delivered_orders.merge(customers, on="customer_id", how="inner")
-        .merge(order_payments, on="order_id", how="left")
+
+
+def retention_finding(selected) -> str:
+    sp = pick(spenders_all, selected).nlargest(10, "total_spent")
+    k = kpi_values(selected)
+    if sp.empty:
+        return "No customers in this view."
+    n = len(sp)
+    one_time = int((sp["total_orders"] == 1).sum())
+    base = 100 - k["repeat_rate"]
+    verdict = (
+        "High spend here comes mostly from single large orders, not repeat visits."
+        if one_time / n >= 0.5
+        else "High spend here comes partly from customers who return."
     )
-    
-    # 5. Customer grain profile (using customer_unique_id)
-    customer_profile = df_orders.groupby("customer_unique_id").agg(
-        total_orders=("order_id", "nunique"),
-        total_spent=("payment_value", "sum"),
-        customer_state=("customer_state", lambda s: s.mode()[0] if not s.mode().empty else s.iloc[0])
-    ).reset_index()
-    
-    customer_profile["is_repeat"] = customer_profile["total_orders"] > 1
-    
-    # 6. State grain aggregation
-    state_summary = customer_profile.groupby("customer_state").agg(
-        total_revenue=("total_spent", "sum"),
-        total_buyers=("customer_unique_id", "nunique"),
-        repeat_buyers=("is_repeat", "sum")
-    ).reset_index()
-    
-    state_summary["repeat_pct"] = (state_summary["repeat_buyers"] / state_summary["total_buyers"]) * 100
-    state_summary = state_summary.sort_values(by="total_revenue", ascending=False)
-    
-    return df_items, customer_profile, state_summary
+    return f"{one_time} of the top {n} highest-spending buyers ({one_time / n:.0%}) ordered only once, versus {base:.1f}% of all buyers in this view. {verdict}"
 
-with st.spinner("Processing delivered transactions from Parquet storage..."):
-    df_items, customer_profile, state_summary = load_parquet_data()
 
-# ---------------------------------------------------------
-# Sidebar Navigation and Filtering
-# ---------------------------------------------------------
-st.sidebar.title("Filter Panel")
-st.sidebar.write("Refine geographic analysis across Brazilian states:")
+# =====================================================================
+# 3. CHARTS
+# =====================================================================
+def style(fig: go.Figure, title: str, height: int = 380) -> go.Figure:
+    fig.update_layout(
+        title=dict(text=title, x=0.01, font=dict(size=16, color=TEXT)),
+        template="plotly_white",
+        height=height,
+        margin=dict(l=55, r=30, t=60, b=50),
+        font=dict(family=FONT, size=12, color=TEXT),
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    return fig
 
-all_states = sorted(state_summary["customer_state"].unique().tolist())
-selected_states = st.sidebar.multiselect(
-    "Select Customer States",
-    options=all_states,
-    default=[]
+
+def fig_categories(top_n: int = 10) -> go.Figure:
+    df = categories.head(top_n)
+    fig = go.Figure(
+        go.Bar(
+            x=df["gross_sales"] / 1e6,
+            y=df["category"].str.replace("_", " ", regex=False),
+            orientation="h",
+            marker_color=BLUE,
+            text=[f"R$ {v / 1e6:.2f}M" if v >= 1e6 else f"R$ {v / 1e3:.0f}k" for v in df["gross_sales"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Sales: R$ %{x:.2f}M<extra></extra>",
+        )
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title_text="Gross sales (R$ millions)", rangemode="tozero")
+    fig.update_layout(margin=dict(l=150, r=70, t=60, b=50))
+    return style(fig, f"Top {top_n} categories by delivered sales (item price)", height=max(340, 28 * top_n + 120))
+
+
+def fig_state_bar(selected) -> go.Figure:
+    df = state_table(selected).head(10)
+    fig = go.Figure(
+        go.Bar(
+            x=df["total_revenue"] / 1e6,
+            y=df["customer_state"],
+            orientation="h",
+            marker_color=BLUE,
+            text=[money(v) for v in df["total_revenue"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Revenue: R$ %{x:.2f}M<extra></extra>",
+        )
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title_text="Delivered revenue (R$ millions)", rangemode="tozero")
+    fig.update_layout(margin=dict(l=55, r=70, t=60, b=50))
+    return style(fig, "Top 10 states by delivered revenue (item price)", height=420)
+
+
+def fig_state_scatter(selected) -> go.Figure:
+    df = state_table(selected)
+    fig = go.Figure(
+        go.Scatter(
+            x=df["total_revenue"] / 1e6,
+            y=df["repeat_pct"],
+            mode="markers+text",
+            text=df["customer_state"],
+            textposition="top center",
+            textfont=dict(size=10),
+            marker=dict(size=[max(8, (b ** 0.5) / 4) for b in df["total_buyers"]], color=BLUE, opacity=0.8,
+                        line=dict(width=1, color="white")),
+            hovertext=[
+                f"<b>{r.customer_state}</b><br>Revenue: {money(r.total_revenue)}<br>Repeat rate: {r.repeat_pct:.2f}%"
+                f"<br>Buyers: {int(r.total_buyers):,}"
+                for r in df.itertuples()
+            ],
+            hoverinfo="text",
+        )
+    )
+    fig.update_xaxes(title_text="Delivered revenue (R$ millions, log scale)", type="log")
+    fig.update_yaxes(title_text="Repeat buyers (% of buyers)", rangemode="tozero")
+    return style(fig, "State revenue vs. repeat purchase rate (bubble size = buyers)", height=420)
+
+
+def fig_spenders(selected) -> go.Figure:
+    sp = pick(spenders_all, selected).nlargest(10, "total_spent").reset_index(drop=True)
+    fig = go.Figure(
+        go.Bar(
+            x=sp["total_spent"],
+            y=[f"Customer #{i + 1} ({r.customer_state})" for i, r in enumerate(sp.itertuples())],
+            orientation="h",
+            marker=dict(color=sp["total_orders"], colorscale="Blues", cmin=0,
+                        colorbar=dict(title="Orders placed")),
+            text=[f"R$ {v:,.0f}" for v in sp["total_spent"]],
+            textposition="outside",
+            hovertemplate="<b>%{y}</b><br>Spend: R$ %{x:,.2f}<extra></extra>",
+        )
+    )
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title_text="Lifetime spend, item price (R$)", rangemode="tozero")
+    fig.update_layout(margin=dict(l=150, r=80, t=60, b=50))
+    return style(fig, "Top 10 highest-spending buyers (color = lifetime orders)", height=420)
+
+
+# =====================================================================
+# 4. TABLE ROWS
+# =====================================================================
+def category_rows(top_n: int) -> list:
+    df = categories.head(top_n).copy()
+    df["category"] = df["category"].str.replace("_", " ", regex=False)
+    return df.round(2).to_dict("records")
+
+
+def freq_rows(selected) -> list:
+    f = pick(freq_all, selected).groupby("lifetime_orders", as_index=False)["buyers"].sum().sort_values("lifetime_orders")
+    total = f["buyers"].sum()
+    f["share"] = (f["buyers"] / total * 100).round(2) if total else 0.0
+    return f.to_dict("records")
+
+
+# =====================================================================
+# 5. PAGE PIECES
+# =====================================================================
+CARD = dict(background="white", border=f"1px solid {BORDER}", borderRadius="12px", padding="14px 18px",
+            boxShadow="0 1px 2px rgba(15, 23, 42, 0.05)")
+ROW = dict(display="flex", gap="16px", flexWrap="wrap", marginBottom="16px")
+HALF = dict(flex="1 1 420px", minWidth="0")
+LABEL = dict(color=MUTED, fontSize="13px", padding="6px 6px 0")
+INT_FMT = Format(group=Group.yes, precision=0, scheme=Scheme.fixed)
+MONEY_FMT = Format(group=Group.yes, precision=2, scheme=Scheme.fixed)
+
+
+def kpi(title: str, value: str, sub: str = "") -> html.Div:
+    return html.Div(
+        [
+            html.Div(title, style=dict(color=MUTED, fontSize="13px")),
+            html.Div(value, style=dict(fontSize="28px", fontWeight="700", color=NAVY)),
+            html.Div(sub, style=dict(color=MUTED, fontSize="12px")),
+        ],
+        style={**CARD, "flex": "1 1 190px", "minWidth": "0"},
+    )
+
+
+def kpi_cards(selected) -> list:
+    k = kpi_values(selected)
+    return [
+        kpi("Delivered revenue", money(k["revenue"]), "item price, freight excluded"),
+        kpi("Unique buyers", f"{k['buyers']:,}", "distinct customers"),
+        kpi("Repeat rate", f"{k['repeat_rate']:.2f}%", "buyers with 2+ delivered orders"),
+        kpi("Avg orders per buyer", f"{k['avg_orders']:.2f}", "delivered orders"),
+    ]
+
+
+def text_box(box_id: str, text: str) -> html.Div:
+    return html.Div(
+        text,
+        id=box_id,
+        style={**CARD, "background": "#EFF6FF", "borderColor": "#BFDBFE", "boxShadow": "none",
+               "lineHeight": "1.6", "fontSize": "14px", "marginTop": "4px"},
+    )
+
+
+def graph_card(graph_id: str, figure: go.Figure) -> html.Div:
+    return html.Div(
+        dcc.Graph(id=graph_id, figure=figure, config=dict(displayModeBar=False), responsive=True),
+        style={**CARD, "padding": "6px"},
+    )
+
+
+def table(table_id: str, columns: list, data: list, page_size: int = 12) -> dash_table.DataTable:
+    numeric = [c["id"] for c in columns if c.get("type") == "numeric"]
+    return dash_table.DataTable(
+        id=table_id,
+        columns=columns,
+        data=data,
+        sort_action="native",
+        page_size=page_size,
+        style_table=dict(overflowX="auto"),
+        style_header=dict(backgroundColor="#EFF6FF", fontWeight="700", color=NAVY, border="none"),
+        style_cell=dict(textAlign="left", padding="8px 10px", fontFamily=FONT, fontSize="13px",
+                        border="none", borderBottom=f"1px solid {BORDER}", minWidth="90px"),
+        style_cell_conditional=[{"if": {"column_id": c}, "textAlign": "right"} for c in numeric],
+    )
+
+
+def recon_card() -> html.Details:
+    rows = [
+        {"measure": "Item price, delivered orders (headline revenue)", "value": recon["item_price"]},
+        {"measure": "Freight charged", "value": recon["freight"]},
+        {"measure": "Item price + freight", "value": recon["item_price"] + recon["freight"]},
+        {"measure": "Payments collected (payment_value)", "value": recon["payment_value"]},
+        {"measure": "Payments minus (item price + freight)",
+         "value": recon["payment_value"] - recon["item_price"] - recon["freight"]},
+    ]
+    cols = [dict(name="Measure", id="measure"), dict(name="R$", id="value", type="numeric", format=MONEY_FMT)]
+    return html.Details(
+        [
+            html.Summary("Revenue reconciliation: item price vs. cash collected (platform-wide)",
+                         style=dict(cursor="pointer", fontWeight="600", color=NAVY)),
+            html.Div(style=dict(height="8px")),
+            table("recon-table", cols, rows, page_size=10),
+            html.Div(
+                "Payments collected are higher than item price because they also include freight and any "
+                "installment interest. This dashboard reports item price, so the category, state and customer "
+                "views all add up to the same number.",
+                style=dict(color=MUTED, fontSize="13px", paddingTop="8px"),
+            ),
+        ],
+        style={**CARD, "marginBottom": "16px"},
+    )
+
+
+def categories_page() -> html.Div:
+    cols = [
+        dict(name="Category", id="category"),
+        dict(name="Gross sales (R$)", id="gross_sales", type="numeric", format=MONEY_FMT),
+        dict(name="Units sold", id="units_sold", type="numeric", format=INT_FMT),
+        dict(name="Avg item price (R$)", id="avg_item_price", type="numeric", format=MONEY_FMT),
+    ]
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div("Show top N categories (covers all states):", style=LABEL),
+                    dcc.Slider(id="top-n", min=5, max=25, step=1, value=10,
+                               marks={5: "5", 10: "10", 15: "15", 20: "20", 25: "25"}),
+                ],
+                style={**CARD, "padding": "10px", "marginBottom": "16px"},
+            ),
+            graph_card("category-bar", fig_categories(10)),
+            html.Div(style=dict(height="16px")),
+            html.Div(
+                [html.Div("Category data", style=dict(fontWeight="700", color=NAVY, marginBottom="6px")),
+                 table("category-table", cols, category_rows(10))],
+                style=CARD,
+            ),
+        ],
+        style=dict(padding="16px 0"),
+    )
+
+
+def geo_page() -> html.Div:
+    return html.Div(
+        [
+            html.Div(
+                [html.Div(graph_card("geo-bar", fig_state_bar(None)), style=HALF),
+                 html.Div(graph_card("geo-scatter", fig_state_scatter(None)), style=HALF)],
+                style=ROW,
+            ),
+            text_box("geo-finding", geo_finding(None)),
+        ],
+        style=dict(padding="16px 0"),
+    )
+
+
+def retention_page() -> html.Div:
+    cols = [
+        dict(name="Lifetime orders", id="lifetime_orders", type="numeric", format=INT_FMT),
+        dict(name="Total buyers", id="buyers", type="numeric", format=INT_FMT),
+        dict(name="Share of buyers (%)", id="share", type="numeric", format=MONEY_FMT),
+    ]
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [html.Div("Order frequency", style=dict(fontWeight="700", color=NAVY, marginBottom="6px")),
+                         table("freq-table", cols, freq_rows(None), page_size=10)],
+                        style={**CARD, "flex": "1 1 320px", "minWidth": "0"},
+                    ),
+                    html.Div(graph_card("spenders-bar", fig_spenders(None)), style={"flex": "2 1 480px", "minWidth": "0"}),
+                ],
+                style=ROW,
+            ),
+            text_box("retention-finding", retention_finding(None)),
+        ],
+        style=dict(padding="16px 0"),
+    )
+
+
+# =====================================================================
+# 6. THE APP: layout + callbacks
+# =====================================================================
+app = Dash(
+    __name__,
+    title="Olist Revenue & Retention Audit",
+    update_title=None,
+    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
+)
+server = app.server  # Render (gunicorn) looks for this
+
+app.index_string = """<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <style>body { margin: 0; background: #F8FAFC; }</style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>"""
+
+TAB = dict(padding="10px 18px", border="none", borderBottom=f"2px solid {BORDER}", background="transparent",
+           color=MUTED, fontWeight="600", fontFamily=FONT)
+TAB_SELECTED = {**TAB, "borderBottom": f"3px solid {BLUE}", "color": NAVY}
+
+warning = []
+if abs(recon["state_total"] - recon["item_price"]) > 0.5:
+    warning = [html.Div(
+        "State totals and item-level totals differ. Some delivered orders may be missing a matching customer record.",
+        style={**CARD, "background": "#FEF3C7", "borderColor": "#FDE68A", "marginBottom": "16px"},
+    )]
+
+app.layout = html.Div(
+    [
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.H1("Olist Revenue Drivers & Customer Retention Audit",
+                                style=dict(margin="0", color=NAVY, fontSize="26px")),
+                        html.Div(QUESTION, style=dict(color=MUTED, margin="4px 0 0", fontSize="14px")),
+                        html.Div(REVENUE_NOTE, style=dict(color=MUTED, margin="2px 0 0", fontSize="12px")),
+                    ],
+                    style=dict(flex="1 1 420px"),
+                ),
+                html.A("View code on GitHub ↗", href=GITHUB_URL, target="_blank",
+                       style=dict(color=BLUE, fontWeight="600", fontSize="14px", textDecoration="none",
+                                  border=f"1px solid {BLUE}", borderRadius="999px", padding="6px 14px",
+                                  whiteSpace="nowrap")),
+            ],
+            style=dict(display="flex", justifyContent="space-between", alignItems="flex-start",
+                       gap="12px", flexWrap="wrap", marginBottom="14px"),
+        ),
+        *warning,
+        html.Div(
+            [
+                html.Div("Filter by customer state (empty = all states). Applies to the cards and to the "
+                         "Geographic and Retention tabs.", style=LABEL),
+                dcc.Dropdown(id="state-filter", options=[{"label": s, "value": s} for s in sorted(ALL_STATE_CODES)],
+                             value=[], multi=True, placeholder="All states"),
+            ],
+            style={**CARD, "padding": "10px", "marginBottom": "16px"},
+        ),
+        html.Div(kpi_cards(None), id="kpi-row", style=ROW),
+        recon_card(),
+        dcc.Tabs(
+            id="tabs",
+            value="categories",
+            children=[
+                dcc.Tab(label="Product Categories", value="categories", children=categories_page(),
+                        style=TAB, selected_style=TAB_SELECTED),
+                dcc.Tab(label="Geographic Concentration", value="geo", children=geo_page(),
+                        style=TAB, selected_style=TAB_SELECTED),
+                dcc.Tab(label="Customer Retention", value="retention", children=retention_page(),
+                        style=TAB, selected_style=TAB_SELECTED),
+            ],
+        ),
+        html.Div(
+            f"Data: Olist Brazilian E-Commerce dataset (Kaggle). Built with Python, Dash and Plotly by {AUTHOR}.",
+            style=dict(color=MUTED, fontSize="12px", textAlign="center", padding="12px 0 4px"),
+        ),
+    ],
+    style=dict(maxWidth="1300px", margin="0 auto", padding="20px", fontFamily=FONT, color=TEXT),
 )
 
-filtered_states = state_summary.copy()
-filtered_customers = customer_profile.copy()
 
-if selected_states:
-    filtered_states = filtered_states[filtered_states["customer_state"].isin(selected_states)]
-    filtered_customers = filtered_customers[filtered_customers["customer_state"].isin(selected_states)]
-
-# ---------------------------------------------------------
-# Top Executive Metrics
-# ---------------------------------------------------------
-st.title("Olist Revenue Drivers and Customer Retention Audit")
-st.caption("Commercial analysis strictly on realized transactions (order_status == 'delivered')")
-
-k1, k2, k3, k4 = st.columns(4)
-
-total_rev = filtered_states["total_revenue"].sum()
-unique_buyers = filtered_customers["customer_unique_id"].nunique()
-repeat_buyers_count = filtered_customers["is_repeat"].sum()
-repeat_rate = (repeat_buyers_count / unique_buyers * 100) if unique_buyers > 0 else 0.0
-avg_orders = filtered_customers["total_orders"].mean() if unique_buyers > 0 else 0.0
-formatted_rev = f"R$ {total_rev / 1e6:.2f}M" if total_rev >= 1e6 else f"R$ {total_rev / 1e3:.1f}k"
+# Callback 1: the state filter updates the four headline cards
+@app.callback(Output("kpi-row", "children"), Input("state-filter", "value"))
+def update_kpis(selected):
+    return kpi_cards(selected)
 
 
-k1.metric("Delivered Revenue", formatted_rev)
-k2.metric("Unique Buyers", f"{unique_buyers:,}")
-k3.metric("Platform Repeat Rate", f"{repeat_rate:.2f}%")
-k4.metric("Avg Orders / Buyer", f"{avg_orders:.2f}")
+# Callback 2: the slider updates the category chart and its table
+@app.callback(Output("category-bar", "figure"), Output("category-table", "data"), Input("top-n", "value"))
+def update_categories(top_n):
+    n = int(top_n or 10)
+    return fig_categories(n), category_rows(n)
 
-st.divider()
 
-# ---------------------------------------------------------
-# Tabbed Visualizations
-# ---------------------------------------------------------
-tab_cat, tab_geo, tab_ret = st.tabs([
-    "Product Categories",
-    "Geographic Concentration",
-    "Customer Retention"
-])
+# Callback 3: the state filter updates the geographic charts and the finding
+@app.callback(
+    Output("geo-bar", "figure"), Output("geo-scatter", "figure"), Output("geo-finding", "children"),
+    Input("state-filter", "value"),
+)
+def update_geo(selected):
+    return fig_state_bar(selected), fig_state_scatter(selected), geo_finding(selected)
 
-# --- Tab 1: Product Categories ---
-with tab_cat:
-    st.subheader("Top Revenue-Generating Product Categories")
-    top_n = st.slider("Select Number of Top Categories", min_value=5, max_value=25, value=10)
 
-    cat_df = df_items.groupby("product_category_name_english").agg(
-        gross_sales=("price", "sum"),
-        units_sold=("order_item_id", "count"),
-        avg_item_price=("price", "mean")
-    ).reset_index().sort_values(by="gross_sales", ascending=False).head(top_n)
+# Callback 4: the state filter updates the retention table, chart and finding
+@app.callback(
+    Output("freq-table", "data"), Output("spenders-bar", "figure"), Output("retention-finding", "children"),
+    Input("state-filter", "value"),
+)
+def update_retention(selected):
+    return freq_rows(selected), fig_spenders(selected), retention_finding(selected)
 
-    fig_cat = px.bar(
-        cat_df,
-        x="gross_sales",
-        y="product_category_name_english",
-        orientation="h",
-        text=cat_df["gross_sales"].apply(lambda v: f"R$ {v/1e6:.2f}M" if v >= 1e6 else f"R$ {v/1e3:.1f}k"),
-        color="gross_sales",
-        color_continuous_scale="Blues",
-        labels={"gross_sales": "Gross Sales (R$)", "product_category_name_english": "Category"},
-        title=f"Top {top_n} Product Categories by Sales Value (Delivered)"
-    )
-    fig_cat.update_layout(yaxis={"categoryorder": "total ascending"}, showlegend=False, height=500)
-    fig_cat.update_traces(textposition="outside", cliponaxis=False)
-    st.plotly_chart(fig_cat, use_container_width=True)
 
-    with st.expander("Inspect Category Data Table"):
-        st.dataframe(cat_df.style.format({
-            "gross_sales": "R$ {:,.2f}",
-            "units_sold": "{:,}",
-            "avg_item_price": "R$ {:,.2f}"
-        }), use_container_width=True)
-
-# --- Tab 2: Geographic Concentration ---
-with tab_geo:
-    st.subheader("State Revenue vs. Repeat Retention")
-    c1, c2 = st.columns(2)
-
-    with c1:
-        top_10_states = filtered_states.head(10)
-        fig_st_rev = px.bar(
-            top_10_states,
-            x="total_revenue",
-            y="customer_state",
-            orientation="h",
-            color="total_revenue",
-            color_continuous_scale="Viridis",
-            labels={"total_revenue": "Fulfilled Revenue (R$)", "customer_state": "State"},
-            title="Top 10 States by Fulfilled Payment Value"
-        )
-        fig_st_rev.update_layout(yaxis={"categoryorder": "total ascending"}, showlegend=False, height=450)
-        st.plotly_chart(fig_st_rev, use_container_width=True)
-
-    with c2:
-        fig_scatter = px.scatter(
-            filtered_states,
-            x="total_revenue",
-            y="repeat_pct",
-            size="total_buyers",
-            text="customer_state",
-            labels={"total_revenue": "Total Revenue (R$)", "repeat_pct": "Repeat Rate (%)"},
-            title="State Revenue vs. Repeat Purchase Rate %"
-        )
-        fig_scatter.update_traces(textposition="top center")
-        fig_scatter.update_layout(height=450)
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-    st.markdown(
-        "> **Key Finding:** While São Paulo (SP), Rio de Janeiro (RJ), and Minas Gerais (MG) account for the vast majority of revenue, their repeat rates hover between **2.9% and 3.3%**. Volume does not drive customer loyalty."
-    )
-
-# --- Tab 3: Customer Retention and Profiling ---
-with tab_ret:
-    st.subheader("Customer Frequency and High-Spender Analysis")
-    col_dist, col_high = st.columns([1, 2])
-
-    with col_dist:
-        freq_df = filtered_customers["total_orders"].value_counts().reset_index()
-        freq_df.columns = ["Lifetime Orders", "Total Buyers"]
-        freq_df["Share"] = (freq_df["Total Buyers"] / freq_df["Total Buyers"].sum()) * 100
-
-        st.write("##### Order Frequency Breakdown")
-        st.dataframe(freq_df.style.format({
-            "Total Buyers": "{:,}",
-            "Share": "{:.2f}%"
-        }), use_container_width=True)
-
-    with col_high:
-        top_spenders = filtered_customers.sort_values(by="total_spent", ascending=False).head(10).copy()
-        top_spenders["clean_label"] = [f"Customer #{i+1} ({row.customer_state})" for i, row in enumerate(top_spenders.itertuples())]
-
-        fig_spenders = px.bar(
-            top_spenders,
-            x="total_spent",
-            y="clean_label",
-            orientation="h",
-            color="total_orders",
-            labels={"total_spent": "Total Lifetime Spend (R$)", "clean_label": "Customer", "total_orders": "Orders Placed"},
-            title="Top 10 Highest Spending Accounts (Color = Lifetime Orders)"
-        )
-        fig_spenders.update_layout(yaxis={"categoryorder": "total ascending"}, height=420)
-        st.plotly_chart(fig_spenders, use_container_width=True)
-
-    st.info(
-        "Commercial Finding: High-spending buyers are primarily one-time buyers who placed large single orders or multi-unit purchases rather than accumulating value over repeated visits."
-    )
+if __name__ == "__main__":
+    app.run(debug=True)  # debug=True is for your own computer; Render uses gunicorn instead

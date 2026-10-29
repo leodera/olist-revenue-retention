@@ -1,6 +1,9 @@
-# .gitignore
+data/
+*.parquet
+.env
 .streamlit/secrets.toml
 venv/
+.venv/
 __pycache__/
-*.parquet
-.ipynb
+*.pyc
+.vscode/
