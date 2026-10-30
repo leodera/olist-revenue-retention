@@ -104,7 +104,7 @@ def geo_finding(selected) -> str:
         return "Select at least 4 states (or none, for all states) to compare revenue with repeat rate."
     top3 = s.head(3)
     share = top3["total_revenue"].sum() / s["total_revenue"].sum() * 100
-    rho = s["total_revenue"].corr(s["repeat_pct"], method="spearman")
+    rho = s["total_revenue"].rank().corr(s["repeat_pct"].rank())
     weak = abs(rho) < 0.3
     return (
         f"The top 3 states ({', '.join(top3['customer_state'])}) bring in {share:.1f}% of revenue in this view, "
